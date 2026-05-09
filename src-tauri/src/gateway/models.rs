@@ -77,6 +77,7 @@ pub struct ModelInfo {
     pub object: String,
     pub created: i64,
     pub owned_by: String,
+    pub context_window: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]

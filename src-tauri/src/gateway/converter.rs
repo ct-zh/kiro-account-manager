@@ -646,27 +646,32 @@ pub async fn build_kiro_payload(
 }
 
 pub fn get_available_models() -> Vec<ModelInfo> {
+    // (model_id, context_window)
+    // claude-sonnet-4-6 / claude-opus-4-6 support 1M context window
+    // claude-sonnet-4-5 / claude-opus-4-5 / claude-haiku-4-5 support 200K
+    // claude-3-7-sonnet supports 200K
     [
-        "claude-opus-4-6",
-        "claude-opus-4-6-20260205",
-        "claude-opus-4-5",
-        "claude-opus-4-5-20251101",
-        "claude-haiku-4-5",
-        "claude-haiku-4-5-20251001",
-        "claude-sonnet-4-6",
-        "claude-sonnet-4-6-20260217",
-        "claude-sonnet-4-5",
-        "claude-sonnet-4-5-20250929",
-        "claude-sonnet-4",
-        "claude-sonnet-4-20250514",
-        "claude-3-7-sonnet-20250219",
+        ("claude-opus-4-6",           1_048_576u32),
+        ("claude-opus-4-6-20260205",  1_048_576),
+        ("claude-opus-4-5",           200_000),
+        ("claude-opus-4-5-20251101",  200_000),
+        ("claude-haiku-4-5",          200_000),
+        ("claude-haiku-4-5-20251001", 200_000),
+        ("claude-sonnet-4-6",         1_048_576),
+        ("claude-sonnet-4-6-20260217",1_048_576),
+        ("claude-sonnet-4-5",         200_000),
+        ("claude-sonnet-4-5-20250929",200_000),
+        ("claude-sonnet-4",           200_000),
+        ("claude-sonnet-4-20250514",  200_000),
+        ("claude-3-7-sonnet-20250219",200_000),
     ]
     .into_iter()
-    .map(|id| ModelInfo {
+    .map(|(id, context_window)| ModelInfo {
         id: id.to_string(),
         object: "model".to_string(),
         created: 1_700_000_000,
         owned_by: "anthropic".to_string(),
+        context_window,
     })
     .collect()
 }
