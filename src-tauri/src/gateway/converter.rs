@@ -493,7 +493,6 @@ pub async fn build_kiro_payload(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let agent_continuation_id = conversation_id.clone();
     let (processed_tools, tool_docs) = process_tools_with_long_descriptions(&request.tools);
-    let tool_docs_for_current = tool_docs.clone();
 
     let mut system_prompt = String::new();
     let mut other_messages = Vec::new();
@@ -595,12 +594,11 @@ pub async fn build_kiro_payload(
     let current_message = merged_messages
         .last()
         .ok_or_else(|| "没有当前消息".to_string())?;
+    let current_message_is_first_user_or_tool =
+        first_user_index == Some(merged_messages.len() - 1);
     let mut current_content = extract_text_content(current_message.content.as_ref());
-    if history.is_none() && !system_prompt.is_empty() {
+    if current_message_is_first_user_or_tool && !system_prompt.is_empty() {
         current_content = join_with_double_newline(&system_prompt, &current_content);
-    }
-    if let Some(tool_docs) = tool_docs_for_current {
-        current_content = join_with_double_newline(&tool_docs, &current_content);
     }
     if current_message.role == "assistant" || current_content.is_empty() {
         current_content = if current_content.is_empty() {
@@ -2061,7 +2059,7 @@ mod tests {
             .current_message
             .user_input_message;
 
-        assert!(current.content.contains("Tool Documentation"));
+        assert_eq!(current.content, "继续总结");
         assert_eq!(current.model_id, "claude-sonnet-4.5");
         assert_eq!(
             payload.profile_arn.as_deref(),
@@ -2086,6 +2084,9 @@ mod tests {
         }
         match &history[1] {
             HistoryItem::User { user_input_message } => {
+                assert!(user_input_message.content.contains("系统要求"));
+                assert!(user_input_message.content.contains("Tool Documentation"));
+                assert_eq!(user_input_message.content.matches("Tool Documentation").count(), 1);
                 let context = user_input_message
                     .user_input_message_context
                     .as_ref()
@@ -2094,6 +2095,60 @@ mod tests {
             }
             other => panic!("unexpected history item: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn build_kiro_payload_injects_long_tool_docs_only_once_for_first_turn() {
+        let request = NormalizedRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            messages: vec![
+                NormalizedMessage {
+                    role: "system".to_string(),
+                    content: Some(json!("系统要求")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    metadata: None,
+                },
+                NormalizedMessage {
+                    role: "user".to_string(),
+                    content: Some(json!("hello")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    metadata: None,
+                },
+            ],
+            stream: false,
+            max_tokens: Some(1024),
+            temperature: None,
+            top_p: None,
+            stop: None,
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: crate::gateway::models::ToolFunction {
+                    name: "search_docs".to_string(),
+                    description: Some("A".repeat(TOOL_DESCRIPTION_MAX_LENGTH + 32)),
+                    parameters: Some(json!({
+                        "type": "object",
+                        "properties": { "q": { "type": "string" } }
+                    })),
+                },
+                web_search: None,
+            }]),
+            tool_choice: None,
+            previous_response_id: None,
+        };
+
+        let payload = build_kiro_payload(&Client::new(), &request, None)
+            .await
+            .expect("payload should build");
+        let current = &payload
+            .conversation_state
+            .current_message
+            .user_input_message;
+
+        assert!(current.content.contains("系统要求"));
+        assert!(current.content.contains("Tool Documentation"));
+        assert_eq!(current.content.matches("Tool Documentation").count(), 1);
     }
 
     #[tokio::test]
