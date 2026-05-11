@@ -263,11 +263,21 @@ pub fn should_add_redirect_for_internal(provider: Option<&str>) -> bool {
     provider.is_some_and(|value| value.trim().eq_ignore_ascii_case("Internal"))
 }
 
-/// 获取 Kiro IDE 设置中的代理
+/// 获取代理配置：优先读 Kiro IDE settings.json，fallback 到环境变量
 fn get_proxy_from_kiro_settings() -> Option<String> {
-    read_kiro_settings_json().and_then(|json| {
+    if let Some(proxy) = read_kiro_settings_json().and_then(|json| {
         get_setting_string(&json, "http.proxy").filter(|value| !value.trim().is_empty())
-    })
+    }) {
+        return Some(proxy);
+    }
+
+    // fallback: 标准环境变量（HTTPS_PROXY 优先，兼容大小写）
+    std::env::var("HTTPS_PROXY")
+        .or_else(|_| std::env::var("https_proxy"))
+        .or_else(|_| std::env::var("HTTP_PROXY"))
+        .or_else(|_| std::env::var("http_proxy"))
+        .ok()
+        .filter(|v| !v.trim().is_empty())
 }
 
 /// 构建 HTTP 客户端（支持代理、超时配置）
