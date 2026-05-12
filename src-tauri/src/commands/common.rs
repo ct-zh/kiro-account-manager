@@ -239,6 +239,18 @@ pub fn is_auth_error_message(error: &str) -> bool {
         || lower.contains("invalid")
 }
 
+/// token 是否仍有效（剩余时间 >= min_remaining_minutes）
+pub fn is_token_still_valid(account: &Account, min_remaining_minutes: i64) -> bool {
+    let Some(expires_at) = &account.expires_at else {
+        return false;
+    };
+    let Ok(exp) = chrono::NaiveDateTime::parse_from_str(expires_at, "%Y/%m/%d %H:%M:%S") else {
+        return false;
+    };
+    let now = chrono::Local::now().naive_local();
+    exp.signed_duration_since(now).num_minutes() >= min_remaining_minutes
+}
+
 /// 计算过期时间字符串
 pub fn calc_expires_at(expires_in: i64) -> String {
     let expires_at = chrono::Local::now() + chrono::Duration::seconds(expires_in);

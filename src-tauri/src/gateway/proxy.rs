@@ -24,8 +24,8 @@ use url::Url;
 use crate::{
     core::account::{Account, AccountStore},
     commands::common::{
-        calc_expires_at, calc_status, get_usage_by_provider, refresh_token_by_provider,
-        RefreshResult,
+        calc_expires_at, calc_status, get_usage_by_provider, is_token_still_valid,
+        refresh_token_by_provider, RefreshResult,
     },
     commands::machine_guid::get_machine_id,
     clients::http_client::{
@@ -1548,76 +1548,103 @@ async fn resolve_managed_account_credentials(
     let mut last_error = "没有可用的账号可供反代使用".to_string();
 
     for (index, account) in accounts.iter().enumerate() {
-        match refresh_token_by_provider(account).await {
-            Ok(refresh) => {
-                let provider = account.provider.as_deref().unwrap_or("Google").to_string();
-                let usage_result = get_usage_by_provider(&provider, &refresh.access_token).await;
-                let mut usage_data = None;
-                let mut is_banned = false;
-                let mut is_auth_error = false;
-
-                if let Ok(usage) = usage_result {
-                    usage_data = Some(usage.usage_data);
-                    is_banned = usage.is_banned;
-                    is_auth_error = usage.is_auth_error;
-                }
-
-                persist_account_refresh(
-                    account,
-                    &refresh,
-                    usage_data.clone(),
-                    is_banned,
-                    is_auth_error,
-                );
-
-                if (is_banned || is_auth_error) && index + 1 < accounts.len() {
-                    last_error = format!("账号 {} 已不可用，尝试下一个账号", account.label);
+        // token 仍有效时跳过远端 refresh，直接使用现有 access_token
+        let (access_token, profile_arn_from_refresh) = if is_token_still_valid(account, 5) {
+            match &account.access_token {
+                Some(token) => (token.clone(), None),
+                None => {
+                    last_error = format!("账号 {} 缺少 access_token", account.label);
                     continue;
                 }
+            }
+        } else {
+            match refresh_token_by_provider(account).await {
+                Ok(refresh) => {
+                    let token = refresh.access_token.clone();
+                    let arn = refresh.profile_arn.clone();
+                    persist_account_refresh(account, &refresh, account.usage_data.clone(), false, false);
+                    (token, arn)
+                }
+                Err(error) => {
+                    last_error = format!(
+                        "刷新账号 {} 失败: {}",
+                        account.label,
+                        sanitize_error(&error)
+                    );
+                    continue;
+                }
+            }
+        };
 
-                if let Some(usage_data) = usage_data {
-                    if usage_exceeds_threshold(&usage_data, config.threshold)
-                        && index + 1 < accounts.len()
-                    {
-                        last_error = format!(
-                            "账号 {} 已达到阈值 {}%，尝试下一个账号",
-                            account.label, config.threshold
-                        );
-                        continue;
+        // usage 查询：token 有效且已有缓存时跳过，否则重新查询
+        let (usage_data, is_banned, is_auth_error) =
+            if is_token_still_valid(account, 5) && account.usage_data.is_some() {
+                let cached = account.usage_data.clone().unwrap();
+                let banned = account.status == "banned";
+                let invalid = account.status == "invalid";
+                (Some(cached), banned, invalid)
+            } else {
+                let provider = account.provider.as_deref().unwrap_or("Google").to_string();
+                let usage_result = get_usage_by_provider(&provider, &access_token).await;
+                let mut data = None;
+                let mut banned = false;
+                let mut auth_err = false;
+                if let Ok(usage) = usage_result {
+                    data = Some(usage.usage_data);
+                    banned = usage.is_banned;
+                    auth_err = usage.is_auth_error;
+                }
+                // 持久化最新 usage 和状态
+                {
+                    let mut store = AccountStore::new();
+                    if let Some(target) = store.accounts.iter_mut().find(|a| a.id == account.id) {
+                        if let Some(ref d) = data {
+                            target.usage_data = Some(d.clone());
+                        }
+                        target.status = calc_status(banned, auth_err);
+                        let _ = store.save_to_file();
                     }
                 }
+                (data, banned, auth_err)
+            };
 
-                let machine_id = account
-                    .machine_id
-                    .clone()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(get_machine_id);
-                let profile_arn = refresh.profile_arn.or_else(|| account.profile_arn.clone());
-                let region = resolve_kiro_upstream_region(
-                    profile_arn.as_deref(),
-                    account.region.as_deref(),
-                    &config.region,
-                );
+        if (is_banned || is_auth_error) && index + 1 < accounts.len() {
+            last_error = format!("账号 {} 已不可用，尝试下一个账号", account.label);
+            continue;
+        }
 
-                return Ok(UpstreamCredentials {
-                    access_token: refresh.access_token,
-                    profile_arn,
-                    provider: account.provider.clone(),
-                    region,
-                    source_label: format_managed_upstream_source(config, account),
-                    user_agent: build_kiro_custom_user_agent(&machine_id),
-                    auth_method: account.auth_method.clone(),
-                    send_opt_out: should_send_codewhisperer_optout(),
-                });
-            }
-            Err(error) => {
+        if let Some(ref usage_data) = usage_data {
+            if usage_exceeds_threshold(usage_data, config.threshold) && index + 1 < accounts.len() {
                 last_error = format!(
-                    "刷新账号 {} 失败: {}",
-                    account.label,
-                    sanitize_error(&error)
+                    "账号 {} 已达到阈值 {}%，尝试下一个账号",
+                    account.label, config.threshold
                 );
+                continue;
             }
         }
+
+        let machine_id = account
+            .machine_id
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(get_machine_id);
+        let profile_arn = profile_arn_from_refresh.or_else(|| account.profile_arn.clone());
+        let region = resolve_kiro_upstream_region(
+            profile_arn.as_deref(),
+            account.region.as_deref(),
+            &config.region,
+        );
+
+        return Ok(UpstreamCredentials {
+            access_token,
+            profile_arn,
+            provider: account.provider.clone(),
+            region,
+            source_label: format_managed_upstream_source(config, account),
+            user_agent: build_kiro_custom_user_agent(&machine_id),
+            auth_method: account.auth_method.clone(),
+            send_opt_out: should_send_codewhisperer_optout(),
+        });
     }
 
     Err(last_error)
