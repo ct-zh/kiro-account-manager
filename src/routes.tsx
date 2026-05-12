@@ -1,5 +1,5 @@
 import { lazy, LazyExoticComponent, ComponentType } from 'react'
-import { Home, Key, Settings2, LogIn, Settings, Info, Network, MessageSquare, LucideIcon } from 'lucide-react'
+import { Home, Key, Settings2, LogIn, Settings, Network, MessageSquare, LucideIcon } from 'lucide-react'
 
 export interface RouteConfig {
   id: string;
@@ -18,7 +18,6 @@ export const routes: RouteConfig[] = [
   { id: 'desktopOAuth', icon: LogIn, nameKey: 'nav.desktopOAuth', descKey: 'nav.socialIdC', component: lazy(() => import('./components/features/Login/index')) },
   { id: 'gateway', icon: Network, nameKey: 'nav.gateway', component: lazy(() => import('./components/features/Gateway/index')) },
   { id: 'settings', icon: Settings, nameKey: 'nav.settings', component: lazy(() => import('./components/features/Settings/index')) },
-  { id: 'about', icon: Info, nameKey: 'nav.about', component: lazy(() => import('./components/features/About/index')) },
 ]
 
 // 内部路由（不在侧边栏显示）
