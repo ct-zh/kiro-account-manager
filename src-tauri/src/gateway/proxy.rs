@@ -39,8 +39,8 @@ use crate::{
 use super::{
     append_gateway_request_log,
     converter::{
-        build_kiro_payload, get_available_models, normalize_anthropic_request,
-        normalize_responses_request,
+        build_kiro_payload, get_available_models, get_internal_model_id,
+        normalize_anthropic_request, normalize_responses_request,
     },
     eventstream::decode_message,
     effective_client_api_keys,
@@ -1848,11 +1848,23 @@ fn validate_model_against_cache(config: &GatewayConfig, model: &str) -> Option<S
         _ => return None,
     };
 
+    // 归一化：把请求 model 和缓存 model_id 都过 get_internal_model_id，
+    // 让 claude-opus-4-7 ↔ claude-opus-4.7 这类横杠/点号差异不再误报。
+    let normalized_request = get_internal_model_id(model).unwrap_or_else(|_| model.to_string());
+
     let mut has_any_cache = false;
     for account in &accounts {
         if let Some(cached) = read_available_models_cache(account, None, false) {
             has_any_cache = true;
-            if cached.available_models.iter().any(|m| m.model_id == model) {
+            let hit = cached.available_models.iter().any(|m| {
+                if m.model_id == model || m.model_id == normalized_request {
+                    return true;
+                }
+                let normalized_cache =
+                    get_internal_model_id(&m.model_id).unwrap_or_else(|_| m.model_id.clone());
+                normalized_cache == normalized_request
+            });
+            if hit {
                 return None;
             }
         }
