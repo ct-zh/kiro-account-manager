@@ -120,13 +120,13 @@ function AccountDetailModal({ account, onClose }: AccountDetailModalProps) {
   const [modelsError, setModelsError] = useState<string | null>(null)
 
   // 获取可用模型
-  const fetchModels = async () => {
+  const fetchModels = async (forceRefresh = false) => {
     setModelsLoading(true)
     setModelsError(null)
     try {
-      const response = await invoke<any>('list_available_models', { 
-        id: account.id, 
-        forceRefresh: false 
+      const response = await invoke<any>('list_available_models', {
+        id: account.id,
+        forceRefresh
       })
       const modelsList = Array.isArray(response?.availableModels) ? response.availableModels : []
       setModels(modelsList)
@@ -542,9 +542,18 @@ function AccountDetailModal({ account, onClose }: AccountDetailModalProps) {
                 <Cpu size={18} className={"text-muted-foreground"} />
               </div>
               <span className={`text-sm font-semibold text-foreground`}>{t('detail.availableModels')}</span>
-              <span className={`ml-auto text-xs px-2 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20 font-medium`}>
+              <span className={`text-xs px-2 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20 font-medium`}>
                 {models.length}
               </span>
+              <button
+                type="button"
+                onClick={() => fetchModels(true)}
+                disabled={modelsLoading}
+                className={`ml-auto p-2 rounded-lg transition-colors duration-200 cursor-pointer focus:outline-none focus:ring-2 focus:ring-blue-500/30 bg-blue-500/20 hover:bg-blue-500/30 disabled:opacity-50 disabled:cursor-not-allowed`}
+                title={t('detail.refreshModels')}
+              >
+                <RefreshCw size={15} className={`text-blue-500 ${modelsLoading ? 'animate-spin' : ''}`} />
+              </button>
             </div>
             <div className="bg-gradient-to-br from-muted/20 to-muted/40 border rounded-xl p-4">
               {modelsLoading ? (

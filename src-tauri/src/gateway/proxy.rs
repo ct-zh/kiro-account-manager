@@ -27,6 +27,7 @@ use crate::{
         calc_expires_at, calc_status, get_usage_by_provider, is_token_still_valid,
         refresh_token_by_provider, RefreshResult,
     },
+    commands::account_models::read_available_models_cache,
     commands::machine_guid::get_machine_id,
     clients::http_client::{
         build_kiro_custom_user_agent,
@@ -45,7 +46,7 @@ use super::{
     effective_client_api_keys,
     models::{
         AnthropicContentBlock, AnthropicMessagesRequest, AnthropicMessagesResponse, AnthropicUsage,
-        ModelsResponse, NormalizedMessage, NormalizedRequest, OpenAIChatRequest, ToolCall,
+        ModelInfo, ModelsResponse, NormalizedMessage, NormalizedRequest, OpenAIChatRequest, ToolCall,
         ToolCallFunction, WebSearchToolOptions,
     },
     stream::{self, aggregate_kiro_response, parse_kiro_event_full, KiroEvent},
@@ -196,12 +197,65 @@ struct GatewayErrorDetails<'a> {
     response_body: Option<&'a str>,
 }
 
-fn build_models_response() -> Value {
+fn build_models_response(config: &GatewayConfig) -> Value {
+    let models = collect_cached_models(config);
     serde_json::to_value(ModelsResponse {
         object: "list".to_string(),
-        data: get_available_models(),
+        data: models,
     })
     .unwrap_or_else(|_| json!({ "object": "list", "data": [] }))
+}
+
+/// 从 GatewayConfig 对应账号的 availableModelsCache 收集模型列表（并集）。
+/// 无任何缓存时降级到硬编码列表。
+fn collect_cached_models(config: &GatewayConfig) -> Vec<ModelInfo> {
+    let mut store = AccountStore::new();
+    store.reload();
+
+    let accounts: Vec<Account> = match config.account_mode.as_str() {
+        "single" => store
+            .accounts
+            .iter()
+            .filter(|a| config.account_id.as_deref() == Some(a.id.as_str()))
+            .cloned()
+            .collect(),
+        "group" => store
+            .accounts
+            .iter()
+            .filter(|a| config.group_id.as_deref() == a.group_id.as_deref() && a.is_available())
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut result: Vec<ModelInfo> = Vec::new();
+
+    for account in &accounts {
+        if let Some(cached) = read_available_models_cache(account, None, false) {
+            for model in cached.available_models {
+                if seen.insert(model.model_id.clone()) {
+                    result.push(ModelInfo {
+                        id: model.model_id,
+                        object: "model".to_string(),
+                        created: 1_700_000_000,
+                        owned_by: model.provider.unwrap_or_else(|| "anthropic".to_string()),
+                        context_window: model
+                            .token_limits
+                            .and_then(|t| t.max_input_tokens)
+                            .map(|v| v as u32)
+                            .unwrap_or(200_000),
+                    });
+                }
+            }
+        }
+    }
+
+    if result.is_empty() {
+        get_available_models()
+    } else {
+        result
+    }
 }
 
 fn build_count_tokens_response(payload: &Value) -> Value {
@@ -325,12 +379,12 @@ pub async fn models_handler(
     headers: HeaderMap,
 ) -> Response {
     guarded_local_response(
-        state,
+        state.clone(),
         client_addr,
         headers,
         "models",
         None,
-        build_models_response(),
+        build_models_response(&state.config),
     )
     .await
 }
@@ -555,6 +609,23 @@ pub async fn proxy_handler(
         request: Some(&request),
         ..base_log_context.clone()
     };
+
+    // 模型校验：从账号缓存读取可用模型列表，校验请求的 model ID 是否在列表中。
+    // 缓存不存在时降级放行，避免误拦截新上线模型。
+    if let Some(invalid_msg) = validate_model_against_cache(&state.config, &request.model) {
+        return gateway_error_with_log(
+            &state,
+            format,
+            &request_log_context,
+            GatewayErrorDetails {
+                status: StatusCode::BAD_REQUEST,
+                error_type: "invalid_request_error",
+                message: &invalid_msg,
+                response_body: None,
+            },
+        )
+        .await;
+    }
 
     let upstream = match resolve_upstream_credentials(&state.config, request_index).await {
         Ok(creds) => creds,
@@ -1648,6 +1719,49 @@ async fn resolve_managed_account_credentials(
     }
 
     Err(last_error)
+}
+
+/// 校验请求的 model ID 是否在账号缓存的可用模型列表中。
+/// 无缓存时返回 None（降级放行），有缓存但不在列表中时返回错误信息。
+fn validate_model_against_cache(config: &GatewayConfig, model: &str) -> Option<String> {
+    if model == "auto" || model == "default" {
+        return None;
+    }
+
+    let mut store = AccountStore::new();
+    store.reload();
+
+    let accounts: Vec<Account> = match config.account_mode.as_str() {
+        "single" => store
+            .accounts
+            .iter()
+            .filter(|a| config.account_id.as_deref() == Some(a.id.as_str()))
+            .cloned()
+            .collect(),
+        "group" => store
+            .accounts
+            .iter()
+            .filter(|a| config.group_id.as_deref() == a.group_id.as_deref() && a.is_available())
+            .cloned()
+            .collect(),
+        _ => return None,
+    };
+
+    let mut has_any_cache = false;
+    for account in &accounts {
+        if let Some(cached) = read_available_models_cache(account, None, false) {
+            has_any_cache = true;
+            if cached.available_models.iter().any(|m| m.model_id == model) {
+                return None;
+            }
+        }
+    }
+
+    if !has_any_cache {
+        return None;
+    }
+
+    Some(format!("模型 {model} 不在当前账号的可用模型列表中，请刷新账号模型缓存或检查模型名称"))
 }
 
 fn format_managed_upstream_source(config: &GatewayConfig, account: &Account) -> String {

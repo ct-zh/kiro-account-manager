@@ -47,7 +47,9 @@ pub struct AvailableModel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListAvailableModelsResponse {
-    #[serde(default)]
+    /// Kiro API 实际返回字段名为 `models`，不是 `availableModels`。
+    /// serialize 时仍用 `availableModels` 兼容前端和 cache。
+    #[serde(default, alias = "models")]
     pub available_models: Vec<AvailableModel>,
     pub next_token: Option<String>,
     pub default_model: Option<AvailableModel>,
@@ -214,10 +216,75 @@ async fn fetch_available_models_page(
         return Err(format!("ListAvailableModels failed ({status}): {body}"));
     }
 
-    response
-        .json::<ListAvailableModelsResponse>()
+    let raw_value: serde_json::Value = response
+        .json()
         .await
-        .map_err(|error| format!("解析 ListAvailableModels 响应失败: {error}"))
+        .map_err(|error| format!("解析 ListAvailableModels 响应失败: {error}"))?;
+
+    let raw_count = raw_value
+        .get("models")
+        .or_else(|| raw_value.get("availableModels"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let raw_default = raw_value
+        .get("defaultModel")
+        .and_then(|v| v.get("modelId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("<none>");
+    log::debug!(
+        "[ListAvailableModels] 原始响应 models.len={raw_count} defaultModel={raw_default}"
+    );
+
+    let parsed = parse_list_available_models_lenient(raw_value);
+    log::debug!(
+        "[ListAvailableModels] 解析后 available_models.len={} default_model={:?}",
+        parsed.available_models.len(),
+        parsed.default_model.as_ref().map(|m| &m.model_id)
+    );
+    Ok(parsed)
+}
+
+/// 宽松解析 ListAvailableModels 响应：
+/// - Kiro API 返回字段名为 `models`（旧版可能为 `availableModels`，两者都尝试）
+/// - 单个模型解析失败时跳过该项，不影响其他模型
+fn parse_list_available_models_lenient(value: serde_json::Value) -> ListAvailableModelsResponse {
+    let mut available_models: Vec<AvailableModel> = Vec::new();
+    let arr = value
+        .get("models")
+        .and_then(|v| v.as_array())
+        .or_else(|| value.get("availableModels").and_then(|v| v.as_array()));
+    if let Some(arr) = arr {
+        for item in arr {
+            match serde_json::from_value::<AvailableModel>(item.clone()) {
+                Ok(model) => available_models.push(model),
+                Err(error) => {
+                    let model_id = item
+                        .get("modelId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<unknown>");
+                    log::warn!(
+                        "[ListAvailableModels] 跳过解析失败的模型 modelId={model_id}: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    let next_token = value
+        .get("nextToken")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let default_model = value
+        .get("defaultModel")
+        .and_then(|v| serde_json::from_value::<AvailableModel>(v.clone()).ok());
+
+    ListAvailableModelsResponse {
+        available_models,
+        next_token,
+        default_model,
+    }
 }
 
 fn mark_default_model(models: &mut [AvailableModel], default_model_id: Option<&str>) {

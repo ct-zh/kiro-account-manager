@@ -448,26 +448,41 @@ fn string_array_from_values(values: &[Value]) -> Vec<String> {
 pub fn get_internal_model_id(external_model: &str) -> Result<String, String> {
     let normalized_model = normalize_external_model_alias(external_model);
     let model_id = match normalized_model.as_str() {
+        // Claude Opus 4.7 (1M context)
+        "claude-opus-4-7" | "claude-opus-4.7" | "opus-4-7" => "claude-opus-4.7",
+        // Claude Opus 4.6 (1M context)
         "claude-opus-4-6-20260205" => "claude-opus-4.6",
         "claude-opus-4-6" | "claude-opus-4.6" | "opus-4-6" => "claude-opus-4.6",
+        // Claude Opus 4.5 (200K)
         "claude-opus-4-5" | "claude-opus-4-5-20251101" | "claude-opus-4.5" | "opus" => {
             "claude-opus-4.5"
         }
+        // Claude Haiku 4.5 (200K)
         "claude-haiku-4-5" | "claude-haiku-4-5-20251001" | "claude-haiku-4.5" | "haiku" => {
             "claude-haiku-4.5"
         }
+        // Claude Sonnet 4.6 (1M context)
         "claude-sonnet-4-6-20260217" => "claude-sonnet-4.6",
         "claude-sonnet-4-6" | "claude-sonnet-4.6" | "sonnet-4-6" => "claude-sonnet-4.6",
+        // Claude Sonnet 4.5 (200K)
         "claude-sonnet-4-5"
         | "claude-sonnet-4-5-20250929"
         | "claude-sonnet-4.5"
         | "claude-sonnet-latest"
         | "sonnet" => "claude-sonnet-4.5",
+        // Claude Sonnet 4 (200K)
         "claude-sonnet-4" | "claude-sonnet-4-20250514" => "claude-sonnet-4",
+        // 旧版 Claude（后端已不返回，保留兼容）
         "claude-3-7-sonnet-20250219" | "claude-3.7-sonnet" => "claude-3-7-sonnet-20250219",
         "claude-3-5-sonnet-20241022" | "claude-3-5-sonnet-latest" | "claude-3.5-sonnet" => {
             "claude-3-5-sonnet-20241022"
         }
+        // 第三方模型（直接透传 modelId）
+        "deepseek-3.2" | "deepseek-v3.2" => "deepseek-3.2",
+        "minimax-m2.5" => "minimax-m2.5",
+        "minimax-m2.1" => "minimax-m2.1",
+        "glm-5" => "glm-5",
+        "qwen3-coder-next" => "qwen3-coder-next",
         "auto" | "default" => "auto",
         other if other.starts_with("claude-opus-4-6-") => "claude-opus-4.6",
         other if other.starts_with("claude-sonnet-4-6-") => "claude-sonnet-4.6",
@@ -649,19 +664,34 @@ pub fn get_available_models() -> Vec<ModelInfo> {
     // claude-sonnet-4-5 / claude-opus-4-5 / claude-haiku-4-5 support 200K
     // claude-3-7-sonnet supports 200K
     [
-        ("claude-opus-4-6",           1_048_576u32),
-        ("claude-opus-4-6-20260205",  1_048_576),
-        ("claude-opus-4-5",           200_000),
-        ("claude-opus-4-5-20251101",  200_000),
-        ("claude-haiku-4-5",          200_000),
+        // Claude 系列（来自 ListAvailableModels 真实返回）
+        ("claude-opus-4.7",      1_048_576u32),
+        ("claude-opus-4-7",      1_048_576),
+        ("claude-opus-4.6",      1_048_576),
+        ("claude-opus-4-6",      1_048_576),
+        ("claude-opus-4-6-20260205", 1_048_576),
+        ("claude-opus-4.5",      200_000),
+        ("claude-opus-4-5",      200_000),
+        ("claude-opus-4-5-20251101", 200_000),
+        ("claude-haiku-4.5",     200_000),
+        ("claude-haiku-4-5",     200_000),
         ("claude-haiku-4-5-20251001", 200_000),
-        ("claude-sonnet-4-6",         1_048_576),
-        ("claude-sonnet-4-6-20260217",1_048_576),
-        ("claude-sonnet-4-5",         200_000),
-        ("claude-sonnet-4-5-20250929",200_000),
-        ("claude-sonnet-4",           200_000),
-        ("claude-sonnet-4-20250514",  200_000),
-        ("claude-3-7-sonnet-20250219",200_000),
+        ("claude-sonnet-4.6",    1_048_576),
+        ("claude-sonnet-4-6",    1_048_576),
+        ("claude-sonnet-4-6-20260217", 1_048_576),
+        ("claude-sonnet-4.5",    200_000),
+        ("claude-sonnet-4-5",    200_000),
+        ("claude-sonnet-4-5-20250929", 200_000),
+        ("claude-sonnet-4",      200_000),
+        ("claude-sonnet-4-20250514", 200_000),
+        // 旧版 Claude（保留兼容）
+        ("claude-3-7-sonnet-20250219", 200_000),
+        // 第三方模型
+        ("deepseek-3.2",         164_000),
+        ("minimax-m2.5",         196_000),
+        ("minimax-m2.1",         196_000),
+        ("glm-5",                200_000),
+        ("qwen3-coder-next",     256_000),
     ]
     .into_iter()
     .map(|(id, context_window)| ModelInfo {
