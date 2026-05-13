@@ -235,16 +235,19 @@ fn collect_cached_models(config: &GatewayConfig) -> Vec<ModelInfo> {
         if let Some(cached) = read_available_models_cache(account, None, false) {
             for model in cached.available_models {
                 if seen.insert(model.model_id.clone()) {
+                    let raw_window = model
+                        .token_limits
+                        .and_then(|t| t.max_input_tokens)
+                        .map(|v| v as u32)
+                        .unwrap_or(200_000);
+                    let adjusted_window = raw_window
+                        .saturating_sub(KIRO_INJECTION_BUFFER.max(0) as u32);
                     result.push(ModelInfo {
                         id: model.model_id,
                         object: "model".to_string(),
                         created: 1_700_000_000,
                         owned_by: model.provider.unwrap_or_else(|| "anthropic".to_string()),
-                        context_window: model
-                            .token_limits
-                            .and_then(|t| t.max_input_tokens)
-                            .map(|v| v as u32)
-                            .unwrap_or(200_000),
+                        context_window: adjusted_window,
                     });
                 }
             }
@@ -253,22 +256,118 @@ fn collect_cached_models(config: &GatewayConfig) -> Vec<ModelInfo> {
 
     if result.is_empty() {
         get_available_models()
+            .into_iter()
+            .map(|mut info| {
+                info.context_window = info
+                    .context_window
+                    .saturating_sub(KIRO_INJECTION_BUFFER.max(0) as u32);
+                info
+            })
+            .collect()
     } else {
         result
     }
 }
 
-fn build_count_tokens_response(payload: &Value) -> Value {
-    let mut chars = 0usize;
-    if let Some(messages) = payload.get("messages").and_then(Value::as_array) {
-        for message in messages {
-            chars += extract_plain_text(message.get("content")).chars().count();
+/// Kiro 后端会在转发请求时注入隐式上下文（系统提示词、工具说明、IDE 上下文等），
+/// 这部分对 Claude Code 不可见，但会真实占用底层模型的 context window。
+/// 用作 `/v1/models` 通告的 context_window 扣减项，以及 message_start 时
+/// `cache_read_input_tokens` 的初始 buffer，避免 CC 把整个标称窗口用满后
+/// 因隐式注入溢出而触发 Kiro 端 "input too large" 错误。
+pub(super) const KIRO_INJECTION_BUFFER: i32 = 30_000;
+
+/// 加权字符计数：CJK / 韩日字符权重高（单字符 ~1 token），其它字符按 ASCII 计。
+/// 用作 token 估算的中间产物，配合 `/ 3.5` 得到 token 数。
+fn weighted_chars(s: &str) -> f64 {
+    s.chars().fold(0f64, |acc, c| {
+        let code = c as u32;
+        let is_cjk = (0x4E00..=0x9FFF).contains(&code)
+            || (0x3400..=0x4DBF).contains(&code)
+            || (0x3040..=0x309F).contains(&code)
+            || (0x30A0..=0x30FF).contains(&code)
+            || (0xAC00..=0xD7AF).contains(&code);
+        if is_cjk {
+            acc + 3.5
+        } else {
+            acc + 1.0
+        }
+    })
+}
+
+/// 递归估算 JSON Value 的加权字符数，覆盖 string / array / object / number / bool。
+fn estimate_value_weighted_chars(value: &Value) -> f64 {
+    match value {
+        Value::String(s) => weighted_chars(s),
+        Value::Array(arr) => arr.iter().map(estimate_value_weighted_chars).sum(),
+        Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| weighted_chars(k) + estimate_value_weighted_chars(v))
+            .sum(),
+        Value::Number(n) => n.to_string().len() as f64,
+        Value::Bool(_) => 4.0,
+        Value::Null => 0.0,
+    }
+}
+
+/// 把加权字符数转换为 token 估算。
+/// 不加 baseline，避免短请求被严重高估（count_tokens 接口下游 CC 用来判断是否需要 /compact）。
+/// 真实 token 数和这里的偏差通过 message_delta 末尾用 Kiro 真实 inputTokens 兜底修正。
+fn weighted_chars_to_tokens(weighted: f64) -> i32 {
+    let estimated = (weighted / 3.5).ceil() as i64;
+    estimated.max(0).min(i64::from(i32::MAX)) as i32
+}
+
+/// 入口 1：从原始请求 payload (Anthropic / OpenAI / Responses 任意格式) 估算 input tokens。
+/// 覆盖 system / messages / tools / input / instructions 五大字段。
+pub(super) fn estimate_input_tokens_from_value(payload: &Value) -> i32 {
+    let mut weighted = 0f64;
+    for field in ["system", "messages", "tools", "input", "instructions"] {
+        if let Some(item) = payload.get(field) {
+            weighted += estimate_value_weighted_chars(item);
         }
     }
-    if let Some(input) = payload.get("input") {
-        chars += extract_plain_text(Some(input)).chars().count();
+    weighted_chars_to_tokens(weighted)
+}
+
+/// 入口 2：从已 normalize 的请求结构估算 input tokens（流式路径用）。
+pub(super) fn estimate_input_tokens_from_request(request: &NormalizedRequest) -> i32 {
+    let mut weighted = 0f64;
+    for message in &request.messages {
+        weighted += weighted_chars(&message.role);
+        if let Some(content) = message.content.as_ref() {
+            weighted += estimate_value_weighted_chars(content);
+        }
+        if let Some(tool_calls) = message.tool_calls.as_ref() {
+            for tc in tool_calls {
+                weighted += weighted_chars(&tc.id);
+                weighted += weighted_chars(&tc.function.name);
+                weighted += weighted_chars(&tc.function.arguments);
+            }
+        }
+        if let Some(tcid) = message.tool_call_id.as_ref() {
+            weighted += weighted_chars(tcid);
+        }
+        if let Some(metadata) = message.metadata.as_ref() {
+            weighted += estimate_value_weighted_chars(metadata);
+        }
     }
-    json!({ "input_tokens": (chars / 4).max(1) })
+    if let Some(tools) = request.tools.as_ref() {
+        for tool in tools {
+            weighted += weighted_chars(&tool.function.name);
+            if let Some(desc) = tool.function.description.as_ref() {
+                weighted += weighted_chars(desc);
+            }
+            if let Some(params) = tool.function.parameters.as_ref() {
+                weighted += estimate_value_weighted_chars(params);
+            }
+        }
+    }
+    weighted_chars_to_tokens(weighted)
+}
+
+fn build_count_tokens_response(payload: &Value) -> Value {
+    let estimated = estimate_input_tokens_from_value(payload).max(1);
+    json!({ "input_tokens": estimated })
 }
 
 fn build_health_response() -> Value {
@@ -801,6 +900,7 @@ pub async fn proxy_handler(
             None,
             Some(STREAMING_RESPONSE_PLACEHOLDER),
         );
+        let estimated_input_tokens = estimate_input_tokens_from_request(&request);
         return stream_proxy_response(
             state.clone(),
             upstream_resp,
@@ -809,6 +909,7 @@ pub async fn proxy_handler(
             request.messages.clone(),
             request.previous_response_id.clone(),
             Vec::new(),
+            estimated_input_tokens,
         );
     }
 
@@ -1877,33 +1978,6 @@ fn extract_usage_totals(usage_data: &Value) -> Option<(i64, i64)> {
     Some((current, limit))
 }
 
-fn extract_plain_text(value: Option<&Value>) -> String {
-    match value {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(|item| {
-                item.get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| {
-                        item.get("content")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Some(Value::Object(map)) => map
-            .get("text")
-            .and_then(Value::as_str)
-            .or_else(|| map.get("content").and_then(Value::as_str))
-            .unwrap_or_default()
-            .to_string(),
-        _ => String::new(),
-    }
-}
-
 fn slice_text_by_char_range(text: &str, start: usize, end: usize) -> Option<String> {
     if end < start {
         return None;
@@ -2078,6 +2152,13 @@ fn build_anthropic_response(
     server_tool_calls: &[ServerToolCall],
 ) -> Value {
     let content = build_anthropic_content_blocks(aggregated, server_tool_calls);
+    // 非流式响应的 usage：把 Kiro 真实 inputTokens（含 Kiro 隐式注入）以
+    // cache_read_input_tokens 形式回传给 CC，让 CC 进度条对齐底层模型真实 token。
+    let cache_read = if aggregated.input_tokens > 0 {
+        Some(aggregated.input_tokens)
+    } else {
+        None
+    };
     serde_json::to_value(AnthropicMessagesResponse {
         id: format!("msg_{}", short_uuid()),
         response_type: "message".to_string(),
@@ -2093,6 +2174,8 @@ fn build_anthropic_response(
         usage: AnthropicUsage {
             input_tokens: aggregated.input_tokens,
             output_tokens: aggregated.output_tokens,
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: cache_read,
         },
     })
     .unwrap_or_else(|_| json!({}))
@@ -2422,6 +2505,30 @@ fn map_upstream_error(status: StatusCode, body: &str) -> (StatusCode, &'static s
     let sanitized = sanitize_error(&extract_error_message(body));
     let explicit_error_type = extract_error_type(body);
     let text = body.to_lowercase();
+
+    // Kiro / CodeWhisperer 端的"上下文超长"错误信号：抓住关键词后强制映射为
+    // Anthropic 标准的 invalid_request_error，让 CC 识别并提示 /compact。
+    let is_context_overflow = text.contains("too long")
+        || text.contains("too large")
+        || text.contains("context length")
+        || text.contains("input length")
+        || text.contains("maximum context")
+        || text.contains("prompt length")
+        || text.contains("input is too")
+        || text.contains("token limit")
+        || text.contains("max_tokens_to_sample")
+        || text.contains("maxinputtokens");
+    if is_context_overflow {
+        let hint = format!(
+            "{sanitized}（上下文超出模型上限，请在 Claude Code 中运行 /compact 压缩历史后重试）"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            hint,
+        );
+    }
+
     let mapped_status = if status == StatusCode::BAD_GATEWAY || status == StatusCode::OK {
         if explicit_error_type == Some("authentication_error") {
             StatusCode::UNAUTHORIZED
@@ -2552,6 +2659,7 @@ fn stream_proxy_response(
     request_messages: Vec<NormalizedMessage>,
     previous_response_id: Option<String>,
     server_tool_calls: Vec<ServerToolCall>,
+    estimated_input_tokens: i32,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(2048);
     tokio::spawn(async move {
@@ -2568,6 +2676,12 @@ fn stream_proxy_response(
         let mut saw_tool_calls = false;
         let mut input_tokens = 0i32;
         let mut output_tokens = 0i32;
+        // CC 上下文进度条 = input_tokens + cache_creation + cache_read + output。
+        // message_start 早于 Kiro Usage 事件，先用 gateway 入站估算 + Kiro 注入 buffer 打底，
+        // 让 CC 看到合理初值；Kiro Usage 到达后用真实 inputTokens 覆盖（cover 隐式注入）。
+        let mut cache_read_input_tokens =
+            estimated_input_tokens.saturating_add(KIRO_INJECTION_BUFFER);
+        let mut kiro_usage_observed = false;
         let anthropic_id = format!("msg_{}", short_uuid());
         let response_id = format!("resp_{}", short_uuid());
         let message_id = format!("msg_{}", short_uuid());
@@ -2701,6 +2815,14 @@ fn stream_proxy_response(
                                             output_tokens = output;
                                             aggregated.input_tokens = input;
                                             aggregated.output_tokens = output;
+                                            // Kiro 返回的 inputTokens 是底层模型真实看到的输入
+                                            // （含 Kiro 隐式注入）。覆盖 message_start 时的估算 buffer，
+                                            // 让 message_delta 末尾 usage 真实反映上下文用量，
+                                            // 驱动 CC 进度条对齐到真实底层 token 数。
+                                            if input > 0 {
+                                                cache_read_input_tokens = input;
+                                                kiro_usage_observed = true;
+                                            }
                                         }
                                         KiroEvent::ContextUsage { percentage } => {
                                             aggregated.context_usage_percentage = Some(percentage);
@@ -2731,6 +2853,7 @@ fn stream_proxy_response(
                                                 &mut thinking_block_index,
                                                 input_tokens,
                                                 output_tokens,
+                                                cache_read_input_tokens,
                                             )
                                             .await;
                                         }
@@ -2751,6 +2874,7 @@ fn stream_proxy_response(
                                                     &mut thinking_block_index,
                                                     input_tokens,
                                                     output_tokens,
+                                                    cache_read_input_tokens,
                                                 )
                                                 .await;
                                             }
@@ -2769,6 +2893,7 @@ fn stream_proxy_response(
                                                         &model,
                                                         input_tokens,
                                                         output_tokens,
+                                                        cache_read_input_tokens,
                                                     )
                                                     .await;
                                                     close_content_block(&tx, &mut text_block_index)
@@ -3003,6 +3128,7 @@ fn stream_proxy_response(
                                                         &model,
                                                         input_tokens,
                                                         output_tokens,
+                                                        cache_read_input_tokens,
                                                     )
                                                     .await;
                                                     close_content_block(
@@ -3132,6 +3258,7 @@ fn stream_proxy_response(
                 &mut thinking_block_index,
                 input_tokens,
                 output_tokens,
+                cache_read_input_tokens,
             )
             .await;
         }
@@ -3141,6 +3268,14 @@ fn stream_proxy_response(
             ResponseFormat::Anthropic => {
                 close_content_block(&tx, &mut text_block_index).await;
                 close_content_block(&tx, &mut thinking_block_index).await;
+                // 最终 usage：用 Kiro 实际返回的 inputTokens（含 Kiro 隐式注入）回填
+                // cache_read_input_tokens；CC 进度条以 message_delta.usage 为最终值，
+                // 这样能对齐到底层模型真实看到的 token 数，自然在 90% 阈值触发 /compact。
+                let final_cache_read = if kiro_usage_observed {
+                    cache_read_input_tokens
+                } else {
+                    cache_read_input_tokens.max(estimated_input_tokens)
+                };
                 let finish = json!({
                     "type": "message_delta",
                     "delta": {
@@ -3148,6 +3283,9 @@ fn stream_proxy_response(
                         "stop_sequence": Value::Null
                     },
                     "usage": {
+                        "input_tokens": input_tokens,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": final_cache_read.max(0),
                         "output_tokens": output_tokens
                     }
                 });
@@ -3303,6 +3441,7 @@ async fn handle_stream_text(
     thinking_block_index: &mut Option<usize>,
     input_tokens: i32,
     output_tokens: i32,
+    cache_read_input_tokens: i32,
 ) {
     if text.is_empty() {
         return;
@@ -3317,6 +3456,7 @@ async fn handle_stream_text(
                 model,
                 input_tokens,
                 output_tokens,
+                cache_read_input_tokens,
             )
             .await;
 
@@ -3413,6 +3553,7 @@ async fn ensure_anthropic_message_start(
     model: &str,
     input_tokens: i32,
     output_tokens: i32,
+    cache_read_input_tokens: i32,
 ) {
     if *message_started {
         return;
@@ -3429,6 +3570,8 @@ async fn ensure_anthropic_message_start(
             "stop_sequence": Value::Null,
             "usage": {
                 "input_tokens": input_tokens,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": cache_read_input_tokens.max(0),
                 "output_tokens": output_tokens
             }
         }

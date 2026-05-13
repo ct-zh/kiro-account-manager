@@ -567,4 +567,8 @@ pub struct AnthropicContentBlock {
 pub struct AnthropicUsage {
     pub input_tokens: i32,
     pub output_tokens: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<i32>,
 }

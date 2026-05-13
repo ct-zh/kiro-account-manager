@@ -1249,7 +1249,13 @@ mod tests {
             .json()
             .await
             .expect("count tokens response should be json");
-        assert_eq!(payload.get("input_tokens").and_then(Value::as_u64), Some(2));
+        // estimate_input_tokens_from_value 覆盖 messages 数组的字段名 + content，
+        // 比旧实现 (chars/4) 更接近 Anthropic 真实计算口径。"hello world" + JSON 结构 ≈ 8 tokens。
+        let tokens = payload
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .expect("input_tokens should be present");
+        assert!(tokens >= 5 && tokens <= 30, "expected reasonable estimate, got {tokens}");
         stop_runtime(&mut runtime).await;
     }
 
