@@ -576,7 +576,7 @@ pub async fn get_gateway_status(
     };
 
     if let Some((config, request_count, last_error, running)) = snapshot {
-        let last_error_text = last_error.lock().await.clone();
+        let last_error_text = last_error.lock().await.take();
         Ok(GatewayStatus {
             running,
             host: config.host.clone(),
